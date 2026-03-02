@@ -1,5 +1,9 @@
 # handle_replies.py
-# March 2026 – OAuth 2.0 User Context – no leading @ + only reply when summoned + parent context
+# OAuth 2.0 User Context – no leading @ + only reply when summoned + parent context
+# Features:
+#   - REPLY_TEST_MODE, LOG_CONVERSATIONS, MAX_REPLIES_PER_DAY via env vars
+#   - Logging ONLY in test mode
+#   - Separate last_mention_id files for test vs live
 
 import os
 import json
@@ -14,16 +18,49 @@ BASE_DIR = os.getenv("BASE_DIR")
 if not BASE_DIR:
     raise ValueError("Environment variable BASE_DIR is not set")
 
-TOKENS_FILE          = os.path.join(BASE_DIR, "tokens.json")
-LAST_MENTION_ID_FILE = os.path.join(BASE_DIR, "last_mention_id.txt")
-REPLY_COUNT_FILE     = os.path.join(BASE_DIR, "daily_reply_count.txt")
-OPT_OUT_FILE         = os.path.join(BASE_DIR, "opt_out_users.txt")
+TOKENS_FILE             = os.path.join(BASE_DIR, "tokens.json")
+LAST_MENTION_LIVE_FILE  = os.path.join(BASE_DIR, "last_mention_id_live.txt")
+LAST_MENTION_TEST_FILE  = os.path.join(BASE_DIR, "last_mention_id_test.txt")
+REPLY_COUNT_FILE        = os.path.join(BASE_DIR, "daily_reply_count.txt")
+OPT_OUT_FILE            = os.path.join(BASE_DIR, "opt_out_users.txt")
 
 MODEL = "grok-4-1-fast-reasoning"
 YOUR_USER_ID = "1112323801017008128"
 YOUR_BOT_USERNAME = "vboterin"          # ← CHANGE THIS to your actual bot username (without @)
-MAX_REPLIES_PER_DAY = 300  # ← Adjust based on your actual tier limits
-REPLY_TEST_MODE = False    # Start with True for safety
+
+# ── Environment variable configurable settings ────────────────────────────
+
+# Test mode – defaults to False
+REPLY_TEST_MODE_STR = os.getenv("REPLY_TEST_MODE", "False").lower()
+REPLY_TEST_MODE = REPLY_TEST_MODE_STR in ("true", "1", "yes", "on", "t")
+
+# Logging – defaults to True (but only active in test mode)
+LOG_CONVERSATIONS_STR = os.getenv("LOG_CONVERSATIONS", "True").lower()
+LOG_CONVERSATIONS = LOG_CONVERSATIONS_STR in ("true", "1", "yes", "on", "t")
+
+# Max replies per day – defaults to 300
+MAX_REPLIES_PER_DAY_STR = os.getenv("MAX_REPLIES_PER_DAY", "300")
+try:
+    MAX_REPLIES_PER_DAY = int(MAX_REPLIES_PER_DAY_STR)
+except ValueError:
+    MAX_REPLIES_PER_DAY = 300
+    print(f"[WARN] Invalid MAX_REPLIES_PER_DAY value '{MAX_REPLIES_PER_DAY_STR}' – using default 300")
+
+LOG_FILE = os.path.join(BASE_DIR, "conversation_log.jsonl")
+
+# Startup config summary
+print(f"[CONFIG] REPLY_TEST_MODE     = {REPLY_TEST_MODE}     (env: {REPLY_TEST_MODE_STR})")
+print(f"[CONFIG] Using last_mention file = last_mention_id_{'test' if REPLY_TEST_MODE else 'live'}.txt")
+print(f"[CONFIG] LOG_CONVERSATIONS    = {LOG_CONVERSATIONS}    (env: {LOG_CONVERSATIONS_STR})")
+print(f"[CONFIG] MAX_REPLIES_PER_DAY  = {MAX_REPLIES_PER_DAY}  (env: {MAX_REPLIES_PER_DAY_STR})")
+print(f"[CONFIG] Model                = {MODEL}")
+print(f"[CONFIG] Log file             = {LOG_FILE}")
+
+if LOG_CONVERSATIONS:
+    if REPLY_TEST_MODE:
+        print("[LOG] Logging ENABLED – test mode only")
+    else:
+        print("[LOG] Logging DISABLED – live mode (no log written)")
 
 SYSTEM_PROMPT = """You reply in a tone and style inspired by Vitalik Buterin — thoughtful, humble, precise, philosophical, calm, reflective.
 Rules:
@@ -51,8 +88,9 @@ tokens = load_tokens()
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 def get_last_mention_id():
-    if os.path.exists(LAST_MENTION_ID_FILE):
-        with open(LAST_MENTION_ID_FILE, "r") as f:
+    file_path = LAST_MENTION_TEST_FILE if REPLY_TEST_MODE else LAST_MENTION_LIVE_FILE
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
             try:
                 return int(f.read().strip())
             except ValueError:
@@ -60,7 +98,8 @@ def get_last_mention_id():
     return None
 
 def save_last_mention_id(mention_id):
-    with open(LAST_MENTION_ID_FILE, "w") as f:
+    file_path = LAST_MENTION_TEST_FILE if REPLY_TEST_MODE else LAST_MENTION_LIVE_FILE
+    with open(file_path, "w") as f:
         f.write(str(mention_id))
 
 def get_opt_out_users():
@@ -90,6 +129,33 @@ def increment_reply_count():
     count = get_today_reply_count() + 1
     with open(REPLY_COUNT_FILE, "w") as f:
         f.write(today + "\n" + str(count) + "\n")
+
+def log_conversation(mention_tweet, parent_context, generated_reply, success=True, reply_tweet_id=None):
+    # Only log in TEST mode
+    if not LOG_CONVERSATIONS or not REPLY_TEST_MODE:
+        return
+
+    author = getattr(mention_tweet.author, 'username', None) if hasattr(mention_tweet, 'author') else None
+
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mention_id": str(mention_tweet.id),
+        "author_id": str(mention_tweet.author_id),
+        "author": author,
+        "prompt_text": mention_tweet.text,
+        "parent": parent_context.strip() or None,
+        "reply": generated_reply,
+        "ok": success,
+        "reply_id": str(reply_tweet_id) if reply_tweet_id else None,
+        "mode": "TEST"
+    }
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+            f.write("\n")
+    except Exception as e:
+        print(f"[LOG ERROR] {type(e).__name__}: {e}")
 
 # ── Grok API ──────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -157,7 +223,7 @@ last_id = get_last_mention_id() or 1
 opt_out = get_opt_out_users()
 
 try:
-    # Fetch mentions (with pagination and parent context)
+    # Fetch mentions
     mentions_response = client_x.get_users_mentions(
         id=YOUR_USER_ID,
         since_id=last_id,
@@ -169,7 +235,7 @@ try:
 
     all_mentions = []
     all_users = {}
-    all_tweets = {}  # For referenced tweets (parents)
+    all_tweets = {}
 
     while mentions_response.data:
         all_mentions.extend(mentions_response.data)
@@ -192,15 +258,15 @@ try:
         )
 
     if not all_mentions:
-        print("[DEBUG] No new mentions found.")
+        print("[INFO] No new mentions found.")
     else:
-        print(f"[DEBUG] Found {len(all_mentions)} new mentions")
+        print(f"[INFO] Found {len(all_mentions)} new mentions")
         for mention in sorted(all_mentions, key=lambda t: int(t.id)):
-            author = all_users.get(mention.author_id)
-            if not author:
+            author_obj = all_users.get(mention.author_id)
+            if not author_obj:
                 continue
 
-            username = author.username
+            username = author_obj.username
             if username.lower() in opt_out:
                 print(f"[SKIP] @{username} is opted out")
                 continue
@@ -211,13 +277,12 @@ try:
                 print(f"[OPTOUT] @{username}")
                 continue
 
-            # Only reply if the mention contains @yourbotusername **in this specific tweet**
             summon_tag = f"@{YOUR_BOT_USERNAME.lower()}"
             if summon_tag not in text_lower:
-                print(f"[SKIP] No '{summon_tag}' in this tweet's text")
+                print(f"[SKIP] No '{summon_tag}' in this tweet")
                 continue
 
-            # #1 Fix: Prevent chain continuation when someone replies to the bot without re-mentioning it
+            # Prevent chain continuation on bot's own tweets
             skip_chain = False
             if mention.referenced_tweets:
                 for ref in mention.referenced_tweets:
@@ -225,16 +290,16 @@ try:
                         parent = all_tweets.get(ref.id)
                         if parent and str(parent.author_id) == YOUR_USER_ID:
                             skip_chain = True
-                            print(f"[SKIP] This tweet is replying to bot's own tweet {ref.id} – prevent chain continuation")
+                            print(f"[SKIP] Reply to bot's own tweet {ref.id}")
                             break
             if skip_chain:
                 continue
 
-            if get_today_reply_count() >= MAX_REPLIES_PER_DAY:
+            if not REPLY_TEST_MODE and get_today_reply_count() >= MAX_REPLIES_PER_DAY:
                 print("[LIMIT] Daily reply limit reached")
                 break
 
-            # Extract parent context if this is a reply
+            # Extract parent context
             parent_context = ""
             if mention.referenced_tweets:
                 for ref in mention.referenced_tweets:
@@ -244,32 +309,40 @@ try:
                             parent_author = all_users.get(parent_tweet.author_id)
                             parent_username = parent_author.username if parent_author else "unknown"
                             parent_context = f'Context from parent tweet by @{parent_username}: "{parent_tweet.text}"\n'
-                        break  # Assume only one parent
+                        break
 
             reply_text = generate_reply(mention.text, username, parent_context)
             if not reply_text:
+                log_conversation(mention, parent_context, None, success=False)
                 continue
 
-            full_reply = reply_text  # No @username prefix
+            full_reply = reply_text
 
             if REPLY_TEST_MODE:
                 print(f"[TEST] Would reply to @{username}: {full_reply}")
-            else:
-                try:
-                    resp = client_x.create_tweet(
-                        text=full_reply,
-                        in_reply_to_tweet_id=mention.id,
-                        user_auth=False
-                    )
-                    print(f"[SUCCESS] Replied to @{username} → tweet id {resp.data['id']}")
-                    increment_reply_count()
-                except tweepy.errors.TooManyRequests:
-                    print("[RATE LIMIT] Hit – stopping")
-                    break
-                except tweepy.TweepyException as e:
-                    print(f"[REPLY ERROR] @{username}: {e}")
+                log_conversation(mention, parent_context, full_reply, success=True)
+                save_last_mention_id(mention.id)  # advance test pointer
+                continue
 
-            save_last_mention_id(mention.id)
+            # ── Live reply ────────────────────────────────────────────────────
+            try:
+                resp = client_x.create_tweet(
+                    text=full_reply,
+                    in_reply_to_tweet_id=mention.id,
+                    user_auth=False
+                )
+                reply_tweet_id = resp.data['id']
+                print(f"[SUCCESS] Replied to @{username} → {reply_tweet_id}")
+                increment_reply_count()
+                # No logging in live mode
+
+            except tweepy.errors.TooManyRequests:
+                print("[RATE LIMIT] Hit – stopping")
+                break
+            except tweepy.TweepyException as e:
+                print(f"[REPLY ERROR] @{username}: {e}")
+
+            save_last_mention_id(mention.id)  # advance live pointer
 
 except Exception as e:
     print(f"[MAIN ERROR] {type(e).__name__}: {e}")
