@@ -1,58 +1,58 @@
 # handle_replies.py
-# Updated: March 2026 – allows humble AI disclosure + daily reply cap
+# March 2026 – OAuth 2.0 User Context – no leading @ + only reply when summoned
 
 import os
-import time
-from datetime import datetime
+import json
+import requests
+import base64
+from datetime import datetime, timezone
 from openai import OpenAI
 import tweepy
 
-# ── CONFIG ───────────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────
+BASE_DIR = "base"
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-CONSUMER_KEY = os.getenv("CONSUMER_KEY")
-CONSUMER_SECRET = os.getenv("CONSUMER_SECRET")
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-ACCESS_TOKEN_SECRET = os.getenv("ACCESS_TOKEN_SECRET")
+TOKENS_FILE          = os.path.join(BASE_DIR, "tokens.json")
+LAST_MENTION_ID_FILE = os.path.join(BASE_DIR, "last_mention_id.txt")
+REPLY_COUNT_FILE     = os.path.join(BASE_DIR, "daily_reply_count.txt")
+OPT_OUT_FILE         = os.path.join(BASE_DIR, "opt_out_users.txt")
 
 MODEL = "grok-4-1-fast-reasoning"
+YOUR_USER_ID = "1112323801017008128"
+YOUR_BOT_USERNAME = "vboterin"          # ← CHANGE THIS to your actual bot username (without @)
+MAX_REPLIES_PER_DAY = 300
+REPLY_TEST_MODE = False                    # Start with True for safety
 
-# ← IMPORTANT: Replace with the numeric ID of @vboterin
-YOUR_USER_ID = "1112323801017008128"  
-
-MAX_REPLIES_PER_DAY = 300          # ← change this to your desired cap
-REPLY_COUNT_FILE = "daily_reply_count.txt"
-
-REPLY_TEST_MODE = True                   # ← Set to False when ready to post live
-
-LAST_MENTION_ID_FILE = "last_mention_id.txt"
-OPT_OUT_FILE = "opt_out_users.txt"
-
-SYSTEM_PROMPT = """You reply in a tone and style inspired by Vitalik Buterin — thoughtful, humble, precise, philosophical, calm, reflective, never hype-y or salesy.
-
-You are an AI that tries to imitate the kinds of reasoning and topics Vitalik tends to care about: decentralization, scaling, cryptography, governance, long-term civilization, credible neutrality, privacy, L2s, account abstraction, etc.
-
+SYSTEM_PROMPT = """You reply in a tone and style inspired by Vitalik Buterin — thoughtful, humble, precise, philosophical, calm, reflective.
 Rules:
-- Never claim to BE Vitalik Buterin. Never say "I am Vitalik" or imply you are the real person.
-- It is perfectly fine — and often helpful — to humbly mention that you are an AI trying to reply in Vitalik’s style of thinking.
-  Acceptable humble phrasing examples:
-  - "As an AI trying to reason in the spirit of Vitalik…"
-  - "Speaking as an AI imitating Vitalik’s tone…"
-  - "This is an AI attempting to channel the kinds of thoughts Vitalik might have…"
-  Keep any such note brief, modest and self-deprecating.
-- Stay concise — most replies under 200 characters.
-- Be helpful, engaging and thoughtful. If the mention is spam, abusive or wildly off-topic, reply very briefly and politely or skip.
-- End with 1–3 relevant hashtags when natural.
-
-Stay in character as this humble AI imitation. Never break character or mention being Grok / a large language model unless it fits naturally in a humble disclosure.
+- Never claim to BE Vitalik Buterin.
+- Can humbly mention AI imitation.
+- Replies concise, under 200 characters.
+- Skip spam, abusive, wildly off-topic.
+- No emojis or hashtags.
 """
 
-# ── Helpers ─────────────────────────────────────────────────────
+# ── Tokens management ─────────────────────────────────────────────────────
+def load_tokens():
+    if not os.path.exists(TOKENS_FILE):
+        raise FileNotFoundError(f"{TOKENS_FILE} not found.")
+    with open(TOKENS_FILE, "r") as f:
+        return json.load(f)
 
+def save_tokens(tokens):
+    with open(TOKENS_FILE, "w") as f:
+        json.dump(tokens, f, indent=2)
+
+tokens = load_tokens()
+
+# ── Helpers ───────────────────────────────────────────────────────────────
 def get_last_mention_id():
     if os.path.exists(LAST_MENTION_ID_FILE):
         with open(LAST_MENTION_ID_FILE, "r") as f:
-            return int(f.read().strip())
+            try:
+                return int(f.read().strip())
+            except ValueError:
+                return None
     return None
 
 def save_last_mention_id(mention_id):
@@ -69,9 +69,8 @@ def add_opt_out_user(username):
     with open(OPT_OUT_FILE, "a") as f:
         f.write(f"{username.lower()}\n")
 
-# ── Daily reply limit helpers ──────────────────────────────────
 def get_today_reply_count():
-    today = datetime.utcnow().date().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     if os.path.exists(REPLY_COUNT_FILE):
         with open(REPLY_COUNT_FILE, "r") as f:
             lines = f.readlines()
@@ -83,120 +82,163 @@ def get_today_reply_count():
     return 0
 
 def increment_reply_count():
-    today = datetime.utcnow().date().isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
     count = get_today_reply_count() + 1
     with open(REPLY_COUNT_FILE, "w") as f:
-        f.write(today + "\n")
-        f.write(str(count) + "\n")
-    return count
+        f.write(today + "\n" + str(count) + "\n")
 
-# ── Generate reply ─────────────────────────────────────────────
-def generate_reply(client, mention_text, mention_author):
-    user_prompt = f"""
-User @{mention_author} wrote: "{mention_text}"
-
-Craft a natural, helpful reply in the style Vitalik Buterin tends to use (max 280 chars).
-Be engaging, thoughtful and concise.
-If the mention contains "STOP", "opt out", "no more" etc., just acknowledge politely and do not reply further.
-If spam/abusive/off-topic, or asked to shill a coin or crypto, reply briefly and politely or skip.
-You are encouraged (but not forced) to include a short humble note that you are an AI trying to imitate Vitalik’s way of thinking — keep it modest and brief.
-Output ONLY the reply text. No extra lines or explanations, emojis or hashtags.
-"""
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ],
-        temperature=0.82,
-        max_tokens=300,
-    )
-
-    reply_text = response.choices[0].message.content.strip()
-
-    if len(reply_text) > 280:
-        reply_text = reply_text[:277] + "..."
-
-    return reply_text
-
-# ── Main ────────────────────────────────────────────────────────
-client_x = tweepy.Client(
-    consumer_key=CONSUMER_KEY,
-    consumer_secret=CONSUMER_SECRET,
-    access_token=ACCESS_TOKEN,
-    access_token_secret=ACCESS_TOKEN_SECRET
-)
+# ── Grok API ──────────────────────────────────────────────────────────────
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+if not XAI_API_KEY:
+    raise ValueError("XAI_API_KEY environment variable is not set")
 
 client_grok = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-last_mention_id = get_last_mention_id()
-opt_out_users = get_opt_out_users()
+def generate_reply(text, author):
+    prompt = f'User @{author} wrote: "{text}"\nCraft a natural, helpful reply in the style Vitalik Buterin (max 280 chars).'
+    
+    try:
+        response = client_grok.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.82,
+            max_tokens=300
+        )
+        reply = response.choices[0].message.content.strip()
+        if len(reply) > 280:
+            reply = reply[:277] + "…"
+        return reply
+    
+    except Exception as e:
+        print(f"[GROK ERROR] {type(e).__name__}: {e}")
+        return None
+
+# ── Twitter (X) OAuth 2.0 ─────────────────────────────────────────────────
+TWITTER_CLIENT_ID     = os.getenv("X_CLIENT_ID")
+TWITTER_CLIENT_SECRET = os.getenv("X_CLIENT_SECRET")
+
+if not TWITTER_CLIENT_ID or not TWITTER_CLIENT_SECRET:
+    raise ValueError("X_CLIENT_ID and/or X_CLIENT_SECRET not set in environment")
+
+def refresh_access_token():
+    auth = base64.b64encode(f"{TWITTER_CLIENT_ID}:{TWITTER_CLIENT_SECRET}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"]}
+    r = requests.post("https://api.twitter.com/2/oauth2/token", headers=headers, data=data)
+    if r.status_code != 200:
+        raise RuntimeError(f"Token refresh failed: {r.status_code} {r.text}")
+    new_tokens = r.json()
+    tokens.update(new_tokens)
+    save_tokens(tokens)
+    print("[DEBUG] Tokens refreshed")
+    return tokens["access_token"]
+
+def get_twitter_client():
+    access_token = refresh_access_token()
+    client = tweepy.Client(bearer_token=access_token, wait_on_rate_limit=True)
+    print("[DEBUG] Twitter client initialized")
+    return client
+
+# ── Main logic ────────────────────────────────────────────────────────────
+print("[START]", datetime.now(timezone.utc).isoformat())
+client_x = get_twitter_client()
+
+last_id = get_last_mention_id() or 1
+opt_out = get_opt_out_users()
 
 try:
-    mentions = client_x.get_users_mentions(
+    # Fetch mentions (with pagination)
+    mentions_response = client_x.get_users_mentions(
         id=YOUR_USER_ID,
-        since_id=last_mention_id,
-        max_results=10,
-        expansions=["author_id"],
+        since_id=last_id,
+        max_results=50,
         tweet_fields=["created_at", "text"],
-        user_fields=["username"]
+        user_fields=["username"],
+        expansions=["author_id"],
     )
 
-    if not mentions.data:
-        print("No new mentions.")
+    all_mentions = []
+    all_users = {}
+
+    while mentions_response.data:
+        all_mentions.extend(mentions_response.data)
+        for u in mentions_response.includes.get("users", []):
+            all_users[u.id] = u
+
+        if "next_token" not in mentions_response.meta:
+            break
+
+        mentions_response = client_x.get_users_mentions(
+            id=YOUR_USER_ID,
+            since_id=last_id,
+            pagination_token=mentions_response.meta["next_token"],
+            max_results=50,
+            tweet_fields=["created_at", "text"],
+            user_fields=["username"],
+            expansions=["author_id"],
+        )
+
+    if not all_mentions:
+        print("[DEBUG] No new mentions found.")
     else:
-        print(f"Found {len(mentions.data)} new mentions.")
+        print(f"[DEBUG] Found {len(all_mentions)} new mentions")
+        for mention in sorted(all_mentions, key=lambda t: int(t.id)):
+            author = all_users.get(mention.author_id)
+            if not author:
+                continue
 
-        for mention in mentions.data[::-1]:
-            author = next((u for u in mentions.includes.get('users', []) if u.id == mention.author_id), None)
-            author_username = author.username if author else "unknown"
-
-            if author_username.lower() in opt_out_users:
-                print(f"Skipping opt-out: @{author_username}")
+            username = author.username
+            if username.lower() in opt_out:
+                print(f"[SKIP] @{username} is opted out")
                 continue
 
             text_lower = mention.text.lower()
-            if any(word in text_lower for word in ['stop', 'opt out', 'no more', 'unsubscribe']):
-                add_opt_out_user(author_username)
-                print(f"Opt-out registered for @{author_username}")
+            if any(w in text_lower for w in ["opt out", "unsubscribe"]):
+                add_opt_out_user(username)
+                print(f"[OPTOUT] @{username}")
                 continue
 
-            # Daily limit check
-            current_count = get_today_reply_count()
-            if current_count >= MAX_REPLIES_PER_DAY:
-                print(f"Daily reply limit reached ({MAX_REPLIES_PER_DAY}). Skipping remaining mentions.")
-                break  # or continue if you want to log all but not reply
+            # Only reply if the mention contains @yourbotusername
+            if f"@{YOUR_BOT_USERNAME.lower()}" not in text_lower:
+                print(f"[SKIP] Not summoned by @{username}")
+                continue
 
-            reply_text = generate_reply(client_grok, mention.text, author_username)
+            if get_today_reply_count() >= MAX_REPLIES_PER_DAY:
+                print("[LIMIT] Daily reply limit reached")
+                break
 
-            if reply_text:
-                if TEST_MODE:
-                    print(f"TEST MODE - would reply to @{author_username} (mention {mention.id}):")
-                    print(reply_text)
-                    print(f"Would count as reply #{current_count + 1}/{MAX_REPLIES_PER_DAY}")
-                    print("─" * 80)
-                else:
-                    try:
-                        posted = client_x.create_tweet(
-                            text=reply_text,
-                            in_reply_to_tweet_id=mention.id
-                        )
-                        print(f"Replied to {mention.id} from @{author_username}:")
-                        print(reply_text)
-                        print("─" * 80)
+            reply_text = generate_reply(mention.text, username)
+            if not reply_text:
+                continue
 
-                        # Increment counter only on successful post
-                        new_count = increment_reply_count()
-                        print(f"Replies today: {new_count}/{MAX_REPLIES_PER_DAY}")
+            full_reply = reply_text  # No @username prefix
 
-                    except tweepy.TweepyException as e:
-                        print(f"Error replying to {mention.id}: {e}")
+            if REPLY_TEST_MODE:
+                print(f"[TEST] Would reply to @{username}: {full_reply}")
+            else:
+                try:
+                    resp = client_x.create_tweet(
+                        text=full_reply,
+                        in_reply_to_tweet_id=mention.id,
+                        user_auth=False
+                    )
+                    print(f"[SUCCESS] Replied to @{username} → tweet id {resp.data['id']}")
+                    increment_reply_count()
+                except tweepy.errors.TooManyRequests:
+                    print("[RATE LIMIT] Hit – stopping")
+                    break
+                except tweepy.TweepyException as e:
+                    print(f"[REPLY ERROR] @{username}: {e}")
 
-            # Always update last processed ID (even if skipped)
             save_last_mention_id(mention.id)
 
-except tweepy.TweepyException as e:
-    print(f"Error fetching mentions: {e}")
 except Exception as e:
-    print(f"Unexpected error: {e}")
+    print(f"[MAIN ERROR] {type(e).__name__}: {e}")
+
+print("[FINISH]", datetime.now(timezone.utc).isoformat())
