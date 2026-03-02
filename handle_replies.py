@@ -211,9 +211,23 @@ try:
                 print(f"[OPTOUT] @{username}")
                 continue
 
-            # Only reply if the mention contains @yourbotusername
-            if f"@{YOUR_BOT_USERNAME.lower()}" not in text_lower:
-                print(f"[SKIP] Not summoned by @{username}")
+            # Only reply if the mention contains @yourbotusername **in this specific tweet**
+            summon_tag = f"@{YOUR_BOT_USERNAME.lower()}"
+            if summon_tag not in text_lower:
+                print(f"[SKIP] No '{summon_tag}' in this tweet's text")
+                continue
+
+            # #1 Fix: Prevent chain continuation when someone replies to the bot without re-mentioning it
+            skip_chain = False
+            if mention.referenced_tweets:
+                for ref in mention.referenced_tweets:
+                    if ref.type == "replied_to":
+                        parent = all_tweets.get(ref.id)
+                        if parent and str(parent.author_id) == YOUR_USER_ID:
+                            skip_chain = True
+                            print(f"[SKIP] This tweet is replying to bot's own tweet {ref.id} – prevent chain continuation")
+                            break
+            if skip_chain:
                 continue
 
             if get_today_reply_count() >= MAX_REPLIES_PER_DAY:
