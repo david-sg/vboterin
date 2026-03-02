@@ -1,5 +1,5 @@
 # handle_replies.py
-# March 2026 – OAuth 2.0 User Context – no leading @ + only reply when summoned
+# March 2026 – OAuth 2.0 User Context – no leading @ + only reply when summoned + parent context
 
 import os
 import json
@@ -10,7 +10,9 @@ from openai import OpenAI
 import tweepy
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-BASE_DIR = "base"
+BASE_DIR = os.getenv("BASE_DIR")
+if not BASE_DIR:
+    raise ValueError("Environment variable BASE_DIR is not set")
 
 TOKENS_FILE          = os.path.join(BASE_DIR, "tokens.json")
 LAST_MENTION_ID_FILE = os.path.join(BASE_DIR, "last_mention_id.txt")
@@ -20,8 +22,8 @@ OPT_OUT_FILE         = os.path.join(BASE_DIR, "opt_out_users.txt")
 MODEL = "grok-4-1-fast-reasoning"
 YOUR_USER_ID = "1112323801017008128"
 YOUR_BOT_USERNAME = "vboterin"          # ← CHANGE THIS to your actual bot username (without @)
-MAX_REPLIES_PER_DAY = 300
-REPLY_TEST_MODE = False                    # Start with True for safety
+MAX_REPLIES_PER_DAY = 300  # ← Adjust based on your actual tier limits
+REPLY_TEST_MODE = False    # Start with True for safety
 
 SYSTEM_PROMPT = """You reply in a tone and style inspired by Vitalik Buterin — thoughtful, humble, precise, philosophical, calm, reflective.
 Rules:
@@ -94,8 +96,8 @@ if not XAI_API_KEY:
 
 client_grok = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
-def generate_reply(text, author):
-    prompt = f'User @{author} wrote: "{text}"\nCraft a natural, helpful reply in the style Vitalik Buterin (max 280 chars).'
+def generate_reply(text, author, parent_context=""):
+    prompt = f'User @{author} wrote: "{text}"\n{parent_context}\nCraft a natural, helpful reply in the style Vitalik Buterin (max 280 chars).'
     
     try:
         response = client_grok.chat.completions.create(
@@ -153,23 +155,26 @@ last_id = get_last_mention_id() or 1
 opt_out = get_opt_out_users()
 
 try:
-    # Fetch mentions (with pagination)
+    # Fetch mentions (with pagination and parent context)
     mentions_response = client_x.get_users_mentions(
         id=YOUR_USER_ID,
         since_id=last_id,
         max_results=50,
-        tweet_fields=["created_at", "text"],
+        tweet_fields=["created_at", "text", "referenced_tweets"],
         user_fields=["username"],
-        expansions=["author_id"],
+        expansions=["author_id", "referenced_tweets.id", "referenced_tweets.id.author_id"],
     )
 
     all_mentions = []
     all_users = {}
+    all_tweets = {}  # For referenced tweets (parents)
 
     while mentions_response.data:
         all_mentions.extend(mentions_response.data)
         for u in mentions_response.includes.get("users", []):
             all_users[u.id] = u
+        for t in mentions_response.includes.get("tweets", []):
+            all_tweets[t.id] = t
 
         if "next_token" not in mentions_response.meta:
             break
@@ -179,9 +184,9 @@ try:
             since_id=last_id,
             pagination_token=mentions_response.meta["next_token"],
             max_results=50,
-            tweet_fields=["created_at", "text"],
+            tweet_fields=["created_at", "text", "referenced_tweets"],
             user_fields=["username"],
-            expansions=["author_id"],
+            expansions=["author_id", "referenced_tweets.id", "referenced_tweets.id.author_id"],
         )
 
     if not all_mentions:
@@ -213,7 +218,19 @@ try:
                 print("[LIMIT] Daily reply limit reached")
                 break
 
-            reply_text = generate_reply(mention.text, username)
+            # Extract parent context if this is a reply
+            parent_context = ""
+            if mention.referenced_tweets:
+                for ref in mention.referenced_tweets:
+                    if ref.type == "replied_to":
+                        parent_tweet = all_tweets.get(ref.id)
+                        if parent_tweet:
+                            parent_author = all_users.get(parent_tweet.author_id)
+                            parent_username = parent_author.username if parent_author else "unknown"
+                            parent_context = f'Context from parent tweet by @{parent_username}: "{parent_tweet.text}"\n'
+                        break  # Assume only one parent
+
+            reply_text = generate_reply(mention.text, username, parent_context)
             if not reply_text:
                 continue
 
