@@ -1,9 +1,8 @@
 # handle_replies.py
 # OAuth 2.0 User Context – no leading @ + only reply when summoned + parent context
-# Features:
-#   - REPLY_TEST_MODE, LOG_CONVERSATIONS, MAX_REPLIES_PER_DAY via env vars
-#   - Logging ONLY in test mode
-#   - Separate last_mention_id files for test vs live
+# Updated: more permissive chain detection (Option B)
+#   - Replies to bot's root tweets are allowed
+#   - Only skips deeper chains (grandparent is also bot)
 
 import os
 import json
@@ -28,17 +27,17 @@ MODEL = "grok-4-1-fast-reasoning"
 YOUR_USER_ID = "1112323801017008128"
 YOUR_BOT_USERNAME = "vboterin"          # ← CHANGE THIS to your actual bot username (without @)
 
+# Safety threshold – adjust to your known recent / safe ID
+MIN_SAFE_MENTION_ID = 2028324822330048710
+
 # ── Environment variable configurable settings ────────────────────────────
 
-# Test mode – defaults to False
 REPLY_TEST_MODE_STR = os.getenv("REPLY_TEST_MODE", "False").lower()
 REPLY_TEST_MODE = REPLY_TEST_MODE_STR in ("true", "1", "yes", "on", "t")
 
-# Logging – defaults to True (but only active in test mode)
 LOG_CONVERSATIONS_STR = os.getenv("LOG_CONVERSATIONS", "True").lower()
 LOG_CONVERSATIONS = LOG_CONVERSATIONS_STR in ("true", "1", "yes", "on", "t")
 
-# Max replies per day – defaults to 300
 MAX_REPLIES_PER_DAY_STR = os.getenv("MAX_REPLIES_PER_DAY", "300")
 try:
     MAX_REPLIES_PER_DAY = int(MAX_REPLIES_PER_DAY_STR)
@@ -55,6 +54,7 @@ print(f"[CONFIG] LOG_CONVERSATIONS    = {LOG_CONVERSATIONS}    (env: {LOG_CONVER
 print(f"[CONFIG] MAX_REPLIES_PER_DAY  = {MAX_REPLIES_PER_DAY}  (env: {MAX_REPLIES_PER_DAY_STR})")
 print(f"[CONFIG] Model                = {MODEL}")
 print(f"[CONFIG] Log file             = {LOG_FILE}")
+print(f"[SAFETY] Minimum allowed since_id = {MIN_SAFE_MENTION_ID}")
 
 if LOG_CONVERSATIONS:
     if REPLY_TEST_MODE:
@@ -94,7 +94,9 @@ def get_last_mention_id():
             try:
                 return int(f.read().strip())
             except ValueError:
+                print(f"[WARN] Could not parse {file_path} – using fallback")
                 return None
+    print(f"[INFO] No last_mention file found for {'test' if REPLY_TEST_MODE else 'live'} mode")
     return None
 
 def save_last_mention_id(mention_id):
@@ -131,7 +133,6 @@ def increment_reply_count():
         f.write(today + "\n" + str(count) + "\n")
 
 def log_conversation(mention_tweet, parent_context, generated_reply, success=True, reply_tweet_id=None):
-    # Only log in TEST mode
     if not LOG_CONVERSATIONS or not REPLY_TEST_MODE:
         return
 
@@ -220,6 +221,15 @@ print("[START]", datetime.now(timezone.utc).isoformat())
 client_x = get_twitter_client()
 
 last_id = get_last_mention_id() or 1
+
+print(f"[INFO] Loaded since_id = {last_id}")
+
+# Safety check against very old / unexpected since_id
+if last_id < MIN_SAFE_MENTION_ID:
+    print(f"[SAFETY WARNING] since_id {last_id} is LOWER than minimum safe ID {MIN_SAFE_MENTION_ID}")
+    print("  → This may cause replies to very old mentions. Check files manually.")
+    # exit(1)   # ← uncomment if you want to force stop on old ID
+
 opt_out = get_opt_out_users()
 
 try:
@@ -282,16 +292,26 @@ try:
                 print(f"[SKIP] No '{summon_tag}' in this tweet")
                 continue
 
-            # Prevent chain continuation on bot's own tweets
+            # ── More permissive chain detection (Option B) ─────────────────────
             skip_chain = False
             if mention.referenced_tweets:
                 for ref in mention.referenced_tweets:
                     if ref.type == "replied_to":
                         parent = all_tweets.get(ref.id)
                         if parent and str(parent.author_id) == YOUR_USER_ID:
-                            skip_chain = True
-                            print(f"[SKIP] Reply to bot's own tweet {ref.id}")
-                            break
+                            # Check if the parent tweet is itself a reply (deeper chain)
+                            if parent.referenced_tweets:
+                                for parent_ref in parent.referenced_tweets:
+                                    if parent_ref.type == "replied_to":
+                                        grandparent = all_tweets.get(parent_ref.id)
+                                        if grandparent and str(grandparent.author_id) == YOUR_USER_ID:
+                                            skip_chain = True
+                                            print(f"[SKIP] Deep chain continuation – grandparent is bot tweet {parent_ref.id}")
+                                            break
+                            # If parent is bot but not a reply → allow (direct user reply to bot)
+                            # → skip_chain remains False
+                        break  # only check the direct parent
+
             if skip_chain:
                 continue
 
@@ -299,7 +319,6 @@ try:
                 print("[LIMIT] Daily reply limit reached")
                 break
 
-            # Extract parent context
             parent_context = ""
             if mention.referenced_tweets:
                 for ref in mention.referenced_tweets:
@@ -321,7 +340,7 @@ try:
             if REPLY_TEST_MODE:
                 print(f"[TEST] Would reply to @{username}: {full_reply}")
                 log_conversation(mention, parent_context, full_reply, success=True)
-                save_last_mention_id(mention.id)  # advance test pointer
+                save_last_mention_id(mention.id)
                 continue
 
             # ── Live reply ────────────────────────────────────────────────────
@@ -334,7 +353,6 @@ try:
                 reply_tweet_id = resp.data['id']
                 print(f"[SUCCESS] Replied to @{username} → {reply_tweet_id}")
                 increment_reply_count()
-                # No logging in live mode
 
             except tweepy.errors.TooManyRequests:
                 print("[RATE LIMIT] Hit – stopping")
@@ -342,7 +360,7 @@ try:
             except tweepy.TweepyException as e:
                 print(f"[REPLY ERROR] @{username}: {e}")
 
-            save_last_mention_id(mention.id)  # advance live pointer
+            save_last_mention_id(mention.id)
 
 except Exception as e:
     print(f"[MAIN ERROR] {type(e).__name__}: {e}")
