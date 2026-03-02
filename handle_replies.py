@@ -33,6 +33,7 @@ Rules:
 - Replies concise, under 240 characters.
 - Skip spam, abusive, wildly off-topic.
 - No emojis or hashtags.
+- Do NOT include any character count, length note, "(X chars)", or similar metadata at the end or anywhere in the reply text.
 """
 
 # ── Tokens management ─────────────────────────────────────────────────────
