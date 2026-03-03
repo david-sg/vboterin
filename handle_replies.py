@@ -145,7 +145,7 @@ def increment_reply_count():
         f.write(today + "\n" + str(count) + "\n")
 
 def log_conversation(mention_tweet, parent_context, generated_reply, success=True, reply_tweet_id=None):
-    if not LOG_CONVERSATIONS or not REPLY_TEST_MODE:
+    if not LOG_CONVERSATIONS:
         return
 
     author = getattr(mention_tweet.author, 'username', None) if hasattr(mention_tweet, 'author') else None
