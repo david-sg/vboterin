@@ -3,6 +3,7 @@
 # Updated: more permissive chain detection (Option B)
 #   - Replies to bot's root tweets are allowed
 #   - Only skips deeper chains (grandparent is also bot)
+# NEW: stricter char limit in prompt + smart trimming to avoid ugly mid-sentence cuts
 
 import os
 import json
@@ -67,7 +68,8 @@ SYSTEM_PROMPT = """Reply exclusively in the style of Vitalik Buterin: thoughtful
 Strict rules:
 - Never claim to be Vitalik Buterin or imply you are the real person.
 - Never mention/tag @VBoterin, @vboterin, @grok, bots, AI, Grok, xAI in the reply (meta commentary about AI imitation allowed only if the tweet is explicitly about the bot).
-- Replies strictly < 240 characters (aim 100–220).
+- Replies MUST be ≤ 210 characters (including spaces). Hard maximum 210 — never exceed.
+- If your draft reply is longer than 210 characters, shorten it aggressively before outputting: remove examples, condense sentences, drop non-essential clauses, prioritize core idea + nuance. Do NOT rely on truncation.
 - No emojis, hashtags, hype words ("amazing", "sharp", "vital", "game-changer"), marketing phrases, or character-count notes.
 - Skip spam, abuse, off-topic or low-effort posts.
 - Vary openings; avoid starting >30% with "Interesting", "Agreed", "Fascinating", "Good point".
@@ -168,6 +170,24 @@ def log_conversation(mention_tweet, parent_context, generated_reply, success=Tru
     except Exception as e:
         print(f"[LOG ERROR] {type(e).__name__}: {e}")
 
+# NEW: smarter trimming to avoid mid-sentence / mid-word cuts
+def smart_trim(text, max_len=210):
+    if len(text) <= max_len:
+        return text
+    
+    # Try to cut at last sentence end before limit
+    for i in range(max_len, 40, -1):
+        if text[i] in '.!?':
+            return text[:i].rstrip() + " …"
+    
+    # Or last comma/space/punctuation
+    for i in range(max_len, 20, -1):
+        if text[i] in ' ,;—':
+            return text[:i].rstrip() + " …"
+    
+    # Worst case: cut at last word boundary
+    return text[:max_len].rsplit(' ', 1)[0].rstrip() + " …"
+
 # ── Grok API ──────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 if not XAI_API_KEY:
@@ -176,7 +196,7 @@ if not XAI_API_KEY:
 client_grok = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
 def generate_reply(text, author, parent_context=""):
-    prompt = f'User @{author} wrote: "{text}"\n{parent_context}\nCraft a natural, helpful reply in the style Vitalik Buterin (max 280 chars).'
+    prompt = f'User @{author} wrote: "{text}"\n{parent_context}\nCraft a natural, helpful reply in the style Vitalik Buterin (max 210 chars).'
     
     try:
         response = client_grok.chat.completions.create(
@@ -189,9 +209,10 @@ def generate_reply(text, author, parent_context=""):
             max_tokens=300
         )
         reply = response.choices[0].message.content.strip()
-        if len(reply) > 280:
-            reply = reply[:277] + "…"
-        return reply
+        
+        # Apply smart trim (enforces the buffer even if model slightly overshoots)
+        trimmed = smart_trim(reply, max_len=210)
+        return trimmed
     
     except Exception as e:
         print(f"[GROK ERROR] {type(e).__name__}: {e}")
@@ -222,7 +243,7 @@ def refresh_access_token():
 
 def get_twitter_client():
     access_token = refresh_access_token()
-    client = tweepy.Client(bearer_token=access_token, wait_on_rate_limit=True)
+    client = tweepy.Client(access_token, wait_on_rate_limit=True)
     print("[DEBUG] Twitter client initialized")
     return client
 
@@ -299,80 +320,4 @@ try:
 
             summon_tag = f"@{YOUR_BOT_USERNAME.lower()}"
             if summon_tag not in text_lower:
-                print(f"[SKIP] No '{summon_tag}' in this tweet")
-                continue
-
-            # ── More permissive chain detection (Option B) ─────────────────────
-            skip_chain = False
-            if mention.referenced_tweets:
-                for ref in mention.referenced_tweets:
-                    if ref.type == "replied_to":
-                        parent = all_tweets.get(ref.id)
-                        if parent and str(parent.author_id) == YOUR_USER_ID:
-                            # Check if the parent tweet is itself a reply (deeper chain)
-                            if parent.referenced_tweets:
-                                for parent_ref in parent.referenced_tweets:
-                                    if parent_ref.type == "replied_to":
-                                        grandparent = all_tweets.get(parent_ref.id)
-                                        if grandparent and str(grandparent.author_id) == YOUR_USER_ID:
-                                            skip_chain = True
-                                            print(f"[SKIP] Deep chain continuation – grandparent is bot tweet {parent_ref.id}")
-                                            break
-                            # If parent is bot but not a reply → allow (direct user reply to bot)
-                            # → skip_chain remains False
-                        break  # only check the direct parent
-
-            if skip_chain:
-                continue
-
-            if not REPLY_TEST_MODE and get_today_reply_count() >= MAX_REPLIES_PER_DAY:
-                print("[LIMIT] Daily reply limit reached")
-                break
-
-            parent_context = ""
-            if mention.referenced_tweets:
-                for ref in mention.referenced_tweets:
-                    if ref.type == "replied_to":
-                        parent_tweet = all_tweets.get(ref.id)
-                        if parent_tweet:
-                            parent_author = all_users.get(parent_tweet.author_id)
-                            parent_username = parent_author.username if parent_author else "unknown"
-                            parent_context = f'Context from parent tweet by @{parent_username}: "{parent_tweet.text}"\n'
-                        break
-
-            reply_text = generate_reply(mention.text, username, parent_context)
-            if not reply_text:
-                log_conversation(mention, parent_context, None, success=False)
-                continue
-
-            full_reply = reply_text
-
-            if REPLY_TEST_MODE:
-                print(f"[TEST] Would reply to @{username}: {full_reply}")
-                log_conversation(mention, parent_context, full_reply, success=True)
-                save_last_mention_id(mention.id)
-                continue
-
-            # ── Live reply ────────────────────────────────────────────────────
-            try:
-                resp = client_x.create_tweet(
-                    text=full_reply,
-                    in_reply_to_tweet_id=mention.id,
-                    user_auth=False
-                )
-                reply_tweet_id = resp.data['id']
-                print(f"[SUCCESS] Replied to @{username} → {reply_tweet_id}")
-                increment_reply_count()
-
-            except tweepy.errors.TooManyRequests:
-                print("[RATE LIMIT] Hit – stopping")
-                break
-            except tweepy.TweepyException as e:
-                print(f"[REPLY ERROR] @{username}: {e}")
-
-            save_last_mention_id(mention.id)
-
-except Exception as e:
-    print(f"[MAIN ERROR] {type(e).__name__}: {e}")
-
-print("[FINISH]", datetime.now(timezone.utc).isoformat())
+                print(f"[SKIP] No '{sum
