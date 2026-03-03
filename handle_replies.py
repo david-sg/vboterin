@@ -3,7 +3,6 @@
 # Updated: more permissive chain detection (Option B)
 #   - Replies to bot's root tweets are allowed
 #   - Only skips deeper chains (grandparent is also bot)
-# Character limit: enforced in prompt + smart trimming
 
 import os
 import json
@@ -26,14 +25,18 @@ OPT_OUT_FILE            = os.path.join(BASE_DIR, "opt_out_users.txt")
 
 MODEL = "grok-4-1-fast-reasoning"
 YOUR_USER_ID = "1112323801017008128"
-YOUR_BOT_USERNAME = "vboterin"          # ← your bot username (without @)
+YOUR_BOT_USERNAME = "vboterin"          # ← CHANGE THIS to your actual bot username (without @)
 
 # Safety threshold – adjust to your known recent / safe ID
 MIN_SAFE_MENTION_ID = 2028324822330048710
 
 # ── Environment variable configurable settings ────────────────────────────
-REPLY_TEST_MODE = os.getenv("REPLY_TEST_MODE", "False").lower() in ("true", "1", "yes", "on", "t")
-LOG_CONVERSATIONS = os.getenv("LOG_CONVERSATIONS", "True").lower() in ("true", "1", "yes", "on", "t")
+
+REPLY_TEST_MODE_STR = os.getenv("REPLY_TEST_MODE", "False").lower()
+REPLY_TEST_MODE = REPLY_TEST_MODE_STR in ("true", "1", "yes", "on", "t")
+
+LOG_CONVERSATIONS_STR = os.getenv("LOG_CONVERSATIONS", "True").lower()
+LOG_CONVERSATIONS = LOG_CONVERSATIONS_STR in ("true", "1", "yes", "on", "t")
 
 MAX_REPLIES_PER_DAY_STR = os.getenv("MAX_REPLIES_PER_DAY", "300")
 try:
@@ -45,16 +48,19 @@ except ValueError:
 LOG_FILE = os.path.join(BASE_DIR, "conversation_log.jsonl")
 
 # Startup config summary
-print(f"[CONFIG] REPLY_TEST_MODE     = {REPLY_TEST_MODE}")
+print(f"[CONFIG] REPLY_TEST_MODE     = {REPLY_TEST_MODE}     (env: {REPLY_TEST_MODE_STR})")
 print(f"[CONFIG] Using last_mention file = last_mention_id_{'test' if REPLY_TEST_MODE else 'live'}.txt")
-print(f"[CONFIG] LOG_CONVERSATIONS    = {LOG_CONVERSATIONS}")
-print(f"[CONFIG] MAX_REPLIES_PER_DAY  = {MAX_REPLIES_PER_DAY}")
+print(f"[CONFIG] LOG_CONVERSATIONS    = {LOG_CONVERSATIONS}    (env: {LOG_CONVERSATIONS_STR})")
+print(f"[CONFIG] MAX_REPLIES_PER_DAY  = {MAX_REPLIES_PER_DAY}  (env: {MAX_REPLIES_PER_DAY_STR})")
 print(f"[CONFIG] Model                = {MODEL}")
 print(f"[CONFIG] Log file             = {LOG_FILE}")
 print(f"[SAFETY] Minimum allowed since_id = {MIN_SAFE_MENTION_ID}")
 
 if LOG_CONVERSATIONS:
-    print("[LOG] Logging " + ("ENABLED – test mode only" if REPLY_TEST_MODE else "DISABLED – live mode"))
+    if REPLY_TEST_MODE:
+        print("[LOG] Logging ENABLED – test mode only")
+    else:
+        print("[LOG] Logging DISABLED – live mode (no log written)")
 
 SYSTEM_PROMPT = """Reply exclusively in the style of Vitalik Buterin: thoughtful, calm, precise, humble, reflective, focused on long-term implications, incentives, coordination, tradeoffs, privacy, public goods, credible neutrality, path-dependence.
 
@@ -164,24 +170,6 @@ def log_conversation(mention_tweet, parent_context, generated_reply, success=Tru
     except Exception as e:
         print(f"[LOG ERROR] {type(e).__name__}: {e}")
 
-# ── Smart trimming to avoid ugly cuts ─────────────────────────────────────
-def smart_trim(text, max_len=210):
-    if len(text) <= max_len:
-        return text
-
-    # Try to cut at last sentence end
-    for i in range(max_len, 40, -1):
-        if text[i] in '.!?':
-            return text[:i].rstrip() + " …"
-
-    # Or last comma / dash / space
-    for i in range(max_len, 20, -1):
-        if text[i] in ' ,;—':
-            return text[:i].rstrip() + " …"
-
-    # Last resort: cut at word boundary
-    return text[:max_len].rsplit(' ', 1)[0].rstrip() + " …"
-
 # ── Grok API ──────────────────────────────────────────────────────────────
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 if not XAI_API_KEY:
@@ -190,8 +178,8 @@ if not XAI_API_KEY:
 client_grok = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
 
 def generate_reply(text, author, parent_context=""):
-    prompt = f'User @{author} wrote: "{text}"\n{parent_context}\nCraft a natural, helpful reply in the style Vitalik Buterin (max 210 chars).'
-
+    prompt = f'User @{author} wrote: "{text}"\n{parent_context}\nCraft a natural, helpful reply in the style Vitalik Buterin (max 280 chars).'
+    
     try:
         response = client_grok.chat.completions.create(
             model=MODEL,
@@ -203,8 +191,10 @@ def generate_reply(text, author, parent_context=""):
             max_tokens=300
         )
         reply = response.choices[0].message.content.strip()
-        return smart_trim(reply, max_len=210)
-
+        if len(reply) > 280:
+            reply = reply[:277] + "…"
+        return reply
+    
     except Exception as e:
         print(f"[GROK ERROR] {type(e).__name__}: {e}")
         return None
@@ -234,8 +224,8 @@ def refresh_access_token():
 
 def get_twitter_client():
     access_token = refresh_access_token()
-    client = tweepy.Client(access_token, wait_on_rate_limit=True)
-    print("[DEBUG] Twitter client initialized with OAuth 2.0 user context")
+    client = tweepy.Client(bearer_token=access_token, wait_on_rate_limit=True)
+    print("[DEBUG] Twitter client initialized")
     return client
 
 # ── Main logic ────────────────────────────────────────────────────────────
@@ -243,15 +233,19 @@ print("[START]", datetime.now(timezone.utc).isoformat())
 client_x = get_twitter_client()
 
 last_id = get_last_mention_id() or 1
+
 print(f"[INFO] Loaded since_id = {last_id}")
 
+# Safety check against very old / unexpected since_id
 if last_id < MIN_SAFE_MENTION_ID:
-    print(f"[SAFETY WARNING] since_id {last_id} < minimum safe ID {MIN_SAFE_MENTION_ID}")
-    # exit(1)   # uncomment to force stop
+    print(f"[SAFETY WARNING] since_id {last_id} is LOWER than minimum safe ID {MIN_SAFE_MENTION_ID}")
+    print("  → This may cause replies to very old mentions. Check files manually.")
+    # exit(1)   # ← uncomment if you want to force stop on old ID
 
 opt_out = get_opt_out_users()
 
 try:
+    # Fetch mentions
     mentions_response = client_x.get_users_mentions(
         id=YOUR_USER_ID,
         since_id=last_id,
@@ -307,25 +301,28 @@ try:
 
             summon_tag = f"@{YOUR_BOT_USERNAME.lower()}"
             if summon_tag not in text_lower:
-                print(f"[SKIP] No '{summon_tag}' in this tweet")   # ← FIXED LINE
+                print(f"[SKIP] No '{summon_tag}' in this tweet")
                 continue
 
-            # Chain detection (Option B – permissive)
+            # ── More permissive chain detection (Option B) ─────────────────────
             skip_chain = False
             if mention.referenced_tweets:
                 for ref in mention.referenced_tweets:
                     if ref.type == "replied_to":
                         parent = all_tweets.get(ref.id)
                         if parent and str(parent.author_id) == YOUR_USER_ID:
+                            # Check if the parent tweet is itself a reply (deeper chain)
                             if parent.referenced_tweets:
                                 for parent_ref in parent.referenced_tweets:
                                     if parent_ref.type == "replied_to":
                                         grandparent = all_tweets.get(parent_ref.id)
                                         if grandparent and str(grandparent.author_id) == YOUR_USER_ID:
                                             skip_chain = True
-                                            print(f"[SKIP] Deep chain – grandparent is bot {parent_ref.id}")
+                                            print(f"[SKIP] Deep chain continuation – grandparent is bot tweet {parent_ref.id}")
                                             break
-                            break
+                            # If parent is bot but not a reply → allow (direct user reply to bot)
+                            # → skip_chain remains False
+                        break  # only check the direct parent
 
             if skip_chain:
                 continue
@@ -353,12 +350,12 @@ try:
             full_reply = reply_text
 
             if REPLY_TEST_MODE:
-                print(f"[TEST] Would reply to @{username}: {full_reply} ({len(full_reply)} chars)")
+                print(f"[TEST] Would reply to @{username}: {full_reply}")
                 log_conversation(mention, parent_context, full_reply, success=True)
                 save_last_mention_id(mention.id)
                 continue
 
-            # Live reply
+            # ── Live reply ────────────────────────────────────────────────────
             try:
                 resp = client_x.create_tweet(
                     text=full_reply,
@@ -366,7 +363,7 @@ try:
                     user_auth=False
                 )
                 reply_tweet_id = resp.data['id']
-                print(f"[SUCCESS] Replied to @{username} → {reply_tweet_id} ({len(full_reply)} chars)")
+                print(f"[SUCCESS] Replied to @{username} → {reply_tweet_id}")
                 increment_reply_count()
 
             except tweepy.errors.TooManyRequests:
