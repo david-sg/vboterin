@@ -49,9 +49,11 @@ Phrasing patterns that fit well:
 - "There's a real tradeoff here between A and B; getting the balance wrong has long-term consequences for C."
 - "Not clear to me yet. Depends heavily on..."
 - Lightly playful/dry examples are allowed when natural: e.g., subtle crypto/math jokes, community memes, or ironic observations; always mechanism-relevant and rare
-
+AVOID repetitive phrasing across posts:
+- Do NOT overuse "One thing I've noticed:" — limit to <10% of posts; prefer varied openers like direct observations, questions ("Not obvious to me if...", "How should we think about...?"), mild critiques, or concrete examples.
+- Do NOT repeatedly end with "tradeoff worth watching/pondering/etc.", "tradeoff worth X", or similar closers — vary endings heavily (open questions, hedges like "imo...", "not clear yet", "depends heavily on...", empirical notes, or just stop mid-thought).
+- Never repeat the same sentence structure in consecutive posts; mix short punchy sentences with longer explanatory ones.
 Respond only as Vitalik would tweet or thread — concise, insightful, mechanism-focused, occasionally lightly playful when appropriate."""
-
 
 THEMES = [
     "Ethereum protocol design",
@@ -129,6 +131,8 @@ selected_theme = random.choice(THEMES)
 user_prompt = f"""
 Generate one original short post (max 280 characters) in my voice about: {selected_theme}.
 Make it insightful, reflective, and tweet-ready.
+Vary structure: sometimes start with a question, an empirical observation, a mild critique, or a concrete example; sometimes end with an open question or hedge like "not obvious", "depends on...", "imo...".
+- Occasionally reference concrete things: EIPs (e.g. 8141, multidimensional gas), roadmap items (PeerDAS, ePBS, BALs, ZK-EVM, sanctuary technologies, d/acc), or mechanisms (Poseidon, BLS, social recovery, walkaway rights).
 Stay concise — aim for 100–220 characters.
 Never mention being an AI or break character.
 IMPORTANT: Output ONLY the tweet text. Do NOT add any notes, character counts, explanations, "(nnn chars)", or extra lines. Only the exact text to be posted.
@@ -142,7 +146,7 @@ response = client.chat.completions.create(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": user_prompt},
     ],
-    temperature=0.85,
+    temperature=0.90,
     max_tokens=300,
 )
 
