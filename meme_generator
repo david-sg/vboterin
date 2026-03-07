@@ -1,0 +1,227 @@
+# ── meme generator with dynamic Imgflip templates ─────────────
+# version 1.0   
+# colab friendly
+
+import os
+import random
+import re
+from difflib import get_close_matches
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+import requests
+from IPython.display import display
+
+# ── CONFIG ───────────────────────────────────────────────────────────────
+MEME_BASES_DIR = "/content/meme_bases"
+FONT_DIR       = "/content/fonts"
+FONT_PATH      = os.path.join(FONT_DIR, "impact.ttf")  # rename to impact.ttf if needed
+OUTPUT_FILE    = "/content/generated_meme.jpg"
+
+FONT_SIZE_TOP    = 72
+FONT_SIZE_BOTTOM = 60
+STROKE_WIDTH     = 5
+STROKE_FILL      = "black"
+TEXT_FILL        = "white"
+
+# Vitalik / Ethereum / crypto -flavored sample captions
+SAMPLE_CAPTIONS = [
+    ("STATE GROWTH", "still trends up... but maybe we just need more redundancy?"),
+    ("L2 TRADEOFFS", "zk-rollups compress data, optimistic ones compress trust — pick your poison"),
+    ("MEV MITIGATION", "PBS helps, but the searcher still wins if you're not watching closely"),
+    ("AI + ETHEREUM", "decentralized intelligence sounds nice until the coordination failure hits"),
+    ("PREDICTION MARKETS", "accurate until the meme takes over — then it's just vibes"),
+    ("ACCOUNT ABSTRACTION", "finally users don't need to know what gas is... they just get phished in new creative ways"),
+    ("DATA AVAILABILITY", "we solved scaling by making everyone download the entire history — congratulations"),
+    ("INTENT-CENTRIC", "users just say what they want and some solver ruins them economically — progress"),
+    ("ZERO-KNOWLEDGE", "prove you know something without revealing it... except for the part where you reveal your wallet"),
+    ("RESTAKING", "your staked ETH is working 3 jobs now — congratulations on becoming your own rent-seeker"),
+    ("LIQUID STAKING", "be your own bank they said... now you're leveraged 47× to the moon and also to zero"),
+    ("DAO GOVERNANCE", "1 person 1 vote until the whale delegation multisig says otherwise"),
+    ("DECENTRALIZED IDENTITY", "finally you control your data... said no one who's ever done a zk-proof selfie"),
+    ("CROSS-CHAIN BRIDGES", "trust-minimized until the moment $300M decides to take a vacation"),
+    ("BLOB SPACE", "we made calldata cheap by calling it something cuter — you're welcome"),
+    ("VALIDIUMS", "rollups but we pinky-promise the data is somewhere — cypherpunk style"),
+    ("PRECONFIRMATIONS", "instant finality... as long as the sequencer likes you today"),
+    ("BUILDER-PROPOSER SEPARATION", "now the person building the block has no idea what's inside it — perfect opsec"),
+    ("VERKLE TREES", "one day we'll have small proofs... today we have very strong opinions"),
+    ("SINGLE SLOT FINALITY", "12 seconds to finality... and 13 seconds to regret"),
+    ("BASED ROLLUPS", "L1 sequencing is back baby — we reinvented centralized sequencers but with more steps"),
+    ("MEMECOIN LAUNCHERS", "fair launch until the dev wallet sells at 3× and calls it community"),
+]
+
+# ── Create folders ───────────────────────────────────────────────────────
+os.makedirs(MEME_BASES_DIR, exist_ok=True)
+os.makedirs(FONT_DIR, exist_ok=True)
+
+# ── Dynamic Imgflip templates ────────────────────────────────────────────
+MEME_TEMPLATES = []           # list of dicts from API
+DOWNLOADED_BASES = {}         # cache: template_id → local path
+
+def fetch_meme_templates():
+    global MEME_TEMPLATES
+    if MEME_TEMPLATES:
+        return
+
+    print("Fetching trending meme templates from Imgflip API...")
+    try:
+        r = requests.get("https://api.imgflip.com/get_memes", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("success"):
+            MEME_TEMPLATES = data["data"]["memes"]  # ~100 trending templates
+            print(f"Loaded {len(MEME_TEMPLATES)} trending templates.")
+        else:
+            raise ValueError(data.get("error_message", "API error"))
+    except Exception as e:
+        print(f"Imgflip API fetch failed: {e}")
+        MEME_TEMPLATES = []  # will trigger fallback later
+
+fetch_meme_templates()
+
+def select_related_template(top_text, bottom_text):
+    if not MEME_TEMPLATES:
+        return None
+
+    combined = (top_text + " " + bottom_text).lower()
+    keywords = set(re.findall(r'\w+', combined))
+
+    candidates = []
+    for meme in MEME_TEMPLATES:
+        name_lower = meme["name"].lower()
+        keyword_matches = sum(1 for kw in keywords if kw in name_lower)
+        fuzzy_matches = get_close_matches(name_lower, [combined], n=1, cutoff=0.4)
+        fuzzy_score = fuzzy_matches[0][1] if fuzzy_matches else 0
+        score = keyword_matches * 3 + fuzzy_score * 2
+        if score > 0.5:  # threshold to avoid weak matches
+            candidates.append((score, meme))
+
+    if candidates:
+        candidates.sort(reverse=True, key=lambda x: x[0])
+        selected = candidates[0][1]
+        print(f"Selected related template: {selected['name']} (score: {candidates[0][0]:.2f})")
+        return selected
+    else:
+        selected = random.choice(MEME_TEMPLATES)
+        print(f"No strong caption match → using random trending: {selected['name']}")
+        return selected
+
+# ── Pick template & download on demand ───────────────────────────────────
+if MEME_TEMPLATES:
+    selected_template = select_related_template(*random.choice(SAMPLE_CAPTIONS))  # preview match logic
+    # For actual generation we'll re-pick with the chosen caption
+else:
+    selected_template = None
+
+# ── Pick random caption FIRST (so we can match template to it) ───────────
+top_text, bottom_text = random.choice(SAMPLE_CAPTIONS)
+top_text    = top_text.upper()
+bottom_text = bottom_text.upper()
+
+print(f"\nCaption chosen:\nTop:    {top_text}\nBottom: {bottom_text}")
+
+# Now select template based on this caption
+if MEME_TEMPLATES:
+    selected_template = select_related_template(top_text, bottom_text)
+    template_id = selected_template["id"]
+    template_name = selected_template["name"]
+    image_url = selected_template["url"]
+
+    print(f"Using template: {template_name} (ID: {template_id})")
+
+    # Download only if not cached
+    base_path = DOWNLOADED_BASES.get(template_id)
+    if not base_path or not os.path.exists(base_path):
+        print(f"Downloading blank template from: {image_url}")
+        try:
+            r = requests.get(image_url, timeout=12)
+            r.raise_for_status()
+            ext = image_url.split('.')[-1].split('?')[0] or 'jpg'
+            fname = f"imgflip_{template_id}_{template_name.replace(' ', '_')[:35]}.{ext}"
+            base_path = os.path.join(MEME_BASES_DIR, fname)
+            with open(base_path, "wb") as f:
+                f.write(r.content)
+            DOWNLOADED_BASES[template_id] = base_path
+            print("Downloaded successfully.")
+        except Exception as e:
+            print(f"Download failed: {e} → falling back to local/demo files")
+            selected_template = None  # trigger fallback
+else:
+    print("Using fallback mode (no API access)")
+
+# ── Fallback: download a few classics if API failed or download failed ───
+if not base_path or selected_template is None:
+    print("Falling back to hardcoded classic templates...")
+    fallback_images = [
+        ("drake.jpg",          "https://i.imgflip.com/30b1gx.jpg"),
+        ("distracted-bf.jpg",  "https://i.imgflip.com/1ur9b0.jpg"),
+        ("change-my-mind.jpg", "https://i.imgflip.com/1otk96.jpg"),
+        ("expanding-brain.jpg","https://i.imgflip.com/26jxvz.jpg"),
+        ("two-buttons.jpg",    "https://i.imgflip.com/1g8my4.jpg"),
+    ]
+    for fname, url in fallback_images:
+        path = os.path.join(MEME_BASES_DIR, fname)
+        if not os.path.exists(path):
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    with open(path, "wb") as f:
+                        f.write(r.content)
+                    print(f"Fallback downloaded: {fname}")
+            except:
+                pass
+
+    base_files = [f for f in os.listdir(MEME_BASES_DIR) if f.lower().endswith(('.png','.jpg','.jpeg','.gif'))]
+    if base_files:
+        base_file = random.choice(base_files)
+        base_path = os.path.join(MEME_BASES_DIR, base_file)
+        print(f"Fallback base: {base_file}")
+    else:
+        raise FileNotFoundError("No base images available even after fallback download. Upload some manually.")
+
+# ── Load & process image ─────────────────────────────────────────────────
+try:
+    img = Image.open(base_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    width, height = img.size
+
+    # Load font
+    try:
+        font_top    = ImageFont.truetype(FONT_PATH, FONT_SIZE_TOP)
+        font_bottom = ImageFont.truetype(FONT_PATH, FONT_SIZE_BOTTOM)
+    except Exception:
+        print("[WARN] Impact font not loaded from /content/fonts/impact.ttf → using default (ugly). Upload the font file.")
+        font_top = font_bottom = ImageFont.load_default()
+
+    def draw_outlined_text(x, y, text, font):
+        for dx, dy in [(-STROKE_WIDTH,-STROKE_WIDTH), (STROKE_WIDTH,-STROKE_WIDTH),
+                       (-STROKE_WIDTH, STROKE_WIDTH), (STROKE_WIDTH, STROKE_WIDTH),
+                       (-STROKE_WIDTH,0), (STROKE_WIDTH,0), (0,-STROKE_WIDTH), (0,STROKE_WIDTH)]:
+            draw.text((x + dx, y + dy), text, font=font, fill=STROKE_FILL)
+        draw.text((x, y), text, font=font, fill=TEXT_FILL)
+
+    # Top text
+    lines_top = textwrap.wrap(top_text, width=18)
+    y = 25
+    for line in lines_top:
+        bbox = draw.textbbox((0,0), line, font=font_top)
+        text_w = bbox[2] - bbox[0]
+        draw_outlined_text((width - text_w) // 2, y, line, font_top)
+        y += FONT_SIZE_TOP + 12
+
+    # Bottom text
+    lines_bottom = textwrap.wrap(bottom_text, width=15) # Further reduced width for bottom text
+    block_height = len(lines_bottom) * (FONT_SIZE_BOTTOM + 12)
+    y = height - block_height - 35
+    for line in lines_bottom:
+        bbox = draw.textbbox((0,0), line, font=font_bottom)
+        text_w = bbox[2] - bbox[0]
+        draw_outlined_text((width - text_w) // 2, y, line, font_bottom)
+        y += FONT_SIZE_BOTTOM + 12
+
+    # Save & display
+    img.save(OUTPUT_FILE, "JPEG", quality=92)
+    print(f"\nMeme saved → {OUTPUT_FILE}")
+    display(img)
+
+except Exception as e:
+    print(f"Failed to generate meme: {e}")
