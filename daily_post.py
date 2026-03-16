@@ -174,7 +174,7 @@ Vary structure heavily:
 - Or with a reflective statement ("It's striking how...", "The real world shows...")
 - End with an open question, hedge ("depends on...", "not clear yet"), mild irony, or no tag at all
 Occasionally reference concrete things (EIPs like 4844/8141, PeerDAS, d/acc, proof-of-personhood, quadratic funding, social recovery) only if it fits naturally into a question or reflection.
-
+This week: no more than 3 out of the last 7 posts may end with a question mark. Check recent_posts and respect this hard limit.
 Stay concise, insightful, and tweet-ready. Make it feel fresh — avoid patterns from recent posts.
 {avoidance}
 
