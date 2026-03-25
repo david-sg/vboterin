@@ -1,5 +1,4 @@
 # daily_post.py
-
 import os
 import random
 import json
@@ -31,7 +30,7 @@ LOG_FILE = "daily_posts.log"
 
 # ── Determine if today is poll day (ONLY Wednesday) ───────────────
 now_utc = datetime.now(timezone.utc)
-weekday = now_utc.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu ...
+weekday = now_utc.weekday()   # 0=Mon ... 2=Wed
 
 is_poll_day = (weekday == 2)   # Only Wednesdays
 
@@ -101,7 +100,6 @@ Generate a short, clear poll question in my voice about: {selected_theme}.
 Requirements:
 - Question must be thoughtful, mechanism-focused, and under 140 characters.
 - Provide exactly 3 or 4 balanced, insightful answer options (each ≤ 25 characters).
-- Make it feel like a genuine Vitalik-style question about tradeoffs, coordination, long-term implications, or decentralization.
 
 Output format (exactly like this, nothing else):
 Question: [your question here]
@@ -116,7 +114,7 @@ else:
     user_prompt = f"""
 Generate one original short post (aim 80–180 characters) in my voice about: {selected_theme}.
 
-Prioritize open-ended questions or reflective observations that historically got high engagement.
+Prioritize open-ended questions or reflective observations.
 Vary structure heavily. Stay concise and insightful.
 {avoidance}
 
@@ -137,7 +135,7 @@ response = client.chat.completions.create(
 
 raw_output = response.choices[0].message.content.strip()
 
-# ── Parse output for poll or normal post ─────────────────────────
+# ── Parse output ─────────────────────────────────────────────────
 if is_poll_day and "Question:" in raw_output:
     lines = [line.strip() for line in raw_output.split('\n') if line.strip()]
     tweet_text = ""
@@ -151,9 +149,8 @@ if is_poll_day and "Question:" in raw_output:
             if option and len(option) <= 25:
                 poll_options.append(option)
     
-    poll_options = poll_options[:4]  # safety limit
+    poll_options = poll_options[:4]
     print(f"[INFO] Generating POLL for Wednesday")
-    
 else:
     tweet_text = raw_output
     poll_options = None
@@ -163,7 +160,7 @@ else:
 log_entry = {
     "id": "TEST" if TEST_MODE else "PENDING",
     "text": tweet_text,
-    "ts": datetime.utcnow().isoformat(),
+    "ts": datetime.now(timezone.utc).isoformat(),   # ← Fixed deprecation warning
     "theme": selected_theme,
     "is_poll": bool(poll_options)
 }
